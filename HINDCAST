@@ -1,0 +1,332 @@
+# Import necessary libraries
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import GradientBoostingRegressor
+import gpytorch
+from gpytorch.models import ExactGP
+from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.kernels import RBFKernel
+from gpytorch.means import ConstantMean
+
+# Data Preprocessing
+data = pd.read_csv('hydro_climatic_data.csv')
+
+# Interpolate IOD and NINO values
+data['IOD'] = data['IOD'].interpolate(method='linear')
+data['NINO'] = data['NINO'].interpolate(method='linear')
+
+# Generate lagged features
+for lag in range(1, 8):
+    for col in ['RH', 'Precipitation', 'MaxTemp', 'MinTemp', 'SoilMoisture', 'WindSpeed']:
+        data[f'{col}_lag{lag}'] = data[col].shift(lag)
+
+# Drop NaN values after lagging
+data = data.dropna()
+
+# Define feature and target variables
+X = data.drop(columns=['Date', 'Streamflow'])
+y = data['Streamflow']
+
+# Feature selection using VIF and Gradient Boosting Machine (GBM)
+def calculate_vif(X):
+    vif_data = pd.DataFrame()
+    vif_data['feature'] = X.columns
+    vif_data['VIF'] = [1 / (1 - LinearRegression().fit(X[[feature]], X[feature]).score(X[[feature]], X[feature]))
+                       for feature in X.columns]
+    return vif_data
+
+vif = calculate_vif(X)
+selected_features = vif[vif['VIF'] < 5]['feature']
+X = X[selected_features]
+
+# Feature Selection using Gradient Boost Machines (GBM)
+gbm = GradientBoostingRegressor()
+gbm.fit(X, y)
+feature_importance = pd.DataFrame({'feature': X.columns, 'importance': gbm.feature_importances_})
+selected_features_gbm = feature_importance[feature_importance['importance'] > 0.01]['feature']
+X = X[selected_features_gbm]
+
+# Train-test split
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Scale Features
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_val = scaler.transform(X_val)
+
+# Define Dataset Class for PyTorch
+class StreamflowDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y.values, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# Prepare DataLoader
+train_dataset = StreamflowDataset(X_train, y_train)
+val_dataset = StreamflowDataset(X_val, y_val)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+# Define LSTM Model
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_dim, 64, batch_first=True)
+        self.fc = nn.Linear(64, 1)
+    
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc(out[:, -1, :])
+        return out
+
+# Define GRU Model
+class GRUModel(nn.Module):
+    def __init__(self, input_dim):
+        super(GRUModel, self).__init__()
+        self.gru = nn.GRU(input_dim, 64, batch_first=True)
+        self.fc = nn.Linear(64, 1)
+    
+    def forward(self, x):
+        out, _ = self.gru(x)
+        out = self.fc(out[:, -1, :])
+        return out
+
+# Define Bayesian Gaussian Process Model (BGP)
+class GPModel(ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super(GPModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = ConstantMean()
+        self.covar_module = RBFKernel()
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return torch.distributions.MultivariateNormal(mean_x, covar_x)
+
+# Train the Models and Hindcasting (LSTM, GRU, GAUSNET)
+
+def train_lstm_model(model, train_loader, val_loader, epochs=100):
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    for epoch in range(epochs):
+        model.train()
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.unsqueeze(2)  # Reshaping for LSTM
+            optimizer.zero_grad()
+            y_pred = model(X_batch)
+            loss = criterion(y_pred.squeeze(), y_batch)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch = X_batch.unsqueeze(2)
+                y_pred = model(X_batch)
+                val_loss += criterion(y_pred.squeeze(), y_batch).item()
+        print(f'Epoch {epoch+1}, Validation Loss: {val_loss/len(val_loader)}')
+
+def train_gru_model(model, train_loader, val_loader, epochs=100):
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    for epoch in range(epochs):
+        model.train()
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.unsqueeze(2)  # Reshaping for GRU
+            optimizer.zero_grad()
+            y_pred = model(X_batch)
+            loss = criterion(y_pred.squeeze(), y_batch)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch = X_batch.unsqueeze(2)
+                y_pred = model(X_batch)
+                val_loss += criterion(y_pred.squeeze(), y_batch).item()
+        print(f'Epoch {epoch+1}, Validation Loss: {val_loss/len(val_loader)}')
+
+def train_gausnet_model(train_x, train_y, test_x, test_y, input_dim):
+    # BGP training
+    likelihood = GaussianLikelihood()
+    model = GPModel(train_x, train_y, likelihood)
+    model.train()
+    likelihood.train()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    mll = ExactMarginalLogLikelihood(likelihood, model)
+
+    for _ in range(100):  # Training for 100 iterations
+        optimizer.zero_grad()
+        output = model(train_x)
+        loss = -mll(output, train_y)
+        loss.backward()
+        optimizer.step()
+
+    # Get probabilistic predictions from BGP
+    model.eval()
+    likelihood.eval()
+    with torch.no_grad():
+        output = model(test_x)
+        pred_mean = output.mean
+        pred_var = output.variance
+
+    # DNN to refine BGP estimates
+    nn_model = StreamflowNN(input_dim)
+    nn_model.train()
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(nn_model.parameters(), lr=0.001)
+
+    for epoch in range(100):
+        optimizer.zero_grad()
+        nn_pred = nn_model(train_x)
+        loss = criterion(nn_pred.squeeze(), train_y)
+        loss.backward()
+        optimizer.step()
+
+    nn_model.eval()
+    nn_pred = nn_model(test_x)
+    
+    # Combine the probabilistic results
+    alpha = 0.5
+    gausnet_pred = alpha * pred_mean + (1 - alpha) * nn_pred
+    return gausnet_pred, pred_var
+
+# Hindcasting and Evaluating Models
+
+def evaluate_model(model, test_loader):
+    model.eval()
+    all_preds = []
+    all_actuals = []
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            y_pred = model(X_batch.unsqueeze(2))  # For LSTM/GRU, add an extra dimension for time steps
+            all_preds.append(y_pred.squeeze().numpy())
+            all_actuals.append(y_batch.numpy())
+
+    all_preds = np.concatenate(all_preds)
+    all_actuals = np.concatenate(all_actuals)
+
+    rmse = np.sqrt(mean_squared_error(all_actuals, all_preds))
+    r2 = r2_score(all_actuals, all_preds)
+
+    print(f'RMSE: {rmse}')
+    print(f'R2 Score: {r2}')
+
+# Initialize models
+lstm_model = LSTMModel(input_dim=X_train.shape[1])
+gru_model = GRUModel(input_dim=X_train.shape[1])
+
+# Train LSTM, GRU models
+train_lstm_model(lstm_model, train_loader, val_loader, epochs=100)
+train_gru_model(gru_model, train_loader, val_loader, epochs=100)
+
+# Hindcasting using GAUSNET
+gausnet_pred, gausnet_var = train_gausnet_model(torch.tensor(X_train), torch.tensor(y_train), 
+                                                torch.tensor(X_val), torch.tensor(y_val), 
+                                                input_dim=X_train.shape[1])
+
+# Evaluate models
+evaluate_model(lstm_model, val_loader)
+evaluate_model(gru_model, val_loader)
+
+# 1. Extract the validation data (from 1985 to 1990) from the dataset
+validation_data = data[(data['Date'] >= '1985-01-01') & (data['Date'] <= '1990-12-31')]
+
+X_val_hindcast = validation_data.drop(columns=['Date', 'Streamflow'])
+y_val_hindcast = validation_data['Streamflow']
+
+# Feature scaling using the same scaler as for training
+X_val_hindcast = scaler.transform(X_val_hindcast)
+
+# Convert to tensor for PyTorch models
+X_val_tensor = torch.tensor(X_val_hindcast, dtype=torch.float32)
+y_val_tensor = torch.tensor(y_val_hindcast.values, dtype=torch.float32)
+
+# Prepare DataLoader for the validation set
+val_dataset_hindcast = StreamflowDataset(X_val_tensor, y_val_tensor)
+val_loader_hindcast = DataLoader(val_dataset_hindcast, batch_size=32, shuffle=False)
+
+# 2. Hindcasting with LSTM Model
+lstm_model.eval()
+lstm_preds = []
+with torch.no_grad():
+    for X_batch, _ in val_loader_hindcast:
+        X_batch = X_batch.unsqueeze(2)  # Reshaping for LSTM
+        y_pred = lstm_model(X_batch)
+        lstm_preds.append(y_pred.squeeze().numpy())
+lstm_preds = np.concatenate(lstm_preds)
+
+# 3. Hindcasting with GRU Model
+gru_model.eval()
+gru_preds = []
+with torch.no_grad():
+    for X_batch, _ in val_loader_hindcast:
+        X_batch = X_batch.unsqueeze(2)  # Reshaping for GRU
+        y_pred = gru_model(X_batch)
+        gru_preds.append(y_pred.squeeze().numpy())
+gru_preds = np.concatenate(gru_preds)
+
+# 4. Hindcasting with GAUSNET Model
+# Note: Assuming you have already trained GAUSNET using the function train_gausnet_model
+# For simplicity, we will use the already trained GAUSNET model.
+gausnet_pred, _ = train_gausnet_model(torch.tensor(X_train), torch.tensor(y_train), 
+                                      torch.tensor(X_val_hindcast), torch.tensor(y_val_hindcast), 
+                                      input_dim=X_train.shape[1])
+
+# 5. Validate the Results by Comparing Hindcasted Results to Actual Data
+# Calculate RMSE and R² for each model
+
+def evaluate_hindcasted_results(predictions, actuals):
+    rmse = np.sqrt(mean_squared_error(actuals, predictions))
+    r2 = r2_score(actuals, predictions)
+    return rmse, r2
+
+# Evaluate LSTM
+lstm_rmse, lstm_r2 = evaluate_hindcasted_results(lstm_preds, y_val_hindcast)
+
+# Evaluate GRU
+gru_rmse, gru_r2 = evaluate_hindcasted_results(gru_preds, y_val_hindcast)
+
+# Evaluate GAUSNET
+gausnet_rmse, gausnet_r2 = evaluate_hindcasted_results(gausnet_pred, y_val_hindcast)
+
+# Print the results
+print(f"LSTM Model - RMSE: {lstm_rmse:.4f}, R²: {lstm_r2:.4f}")
+print(f"GRU Model - RMSE: {gru_rmse:.4f}, R²: {gru_r2:.4f}")
+print(f"GAUSNET Model - RMSE: {gausnet_rmse:.4f}, R²: {gausnet_r2:.4f}")
+
+# Visualize the hindcasted results vs actual values (optional)
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(12, 6))
+plt.plot(validation_data['Date'], y_val_hindcast, label='Actual Streamflow', color='black', linewidth=2)
+plt.plot(validation_data['Date'], lstm_preds, label='LSTM Predicted', color='blue', linestyle='dashed')
+plt.plot(validation_data['Date'], gru_preds, label='GRU Predicted', color='green', linestyle='dashed')
+plt.plot(validation_data['Date'], gausnet_pred, label='GAUSNET Predicted', color='red', linestyle='dashed')
+plt.legend(loc='best')
+plt.title('Hindcasting Results for 1985-1990')
+plt.xlabel('Date')
+plt.ylabel('Streamflow')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
