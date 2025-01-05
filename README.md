@@ -1,0 +1,3 @@
+•	To formulate a novel hybridized framework of Gaussian Process-Integrated Neural Network for Streamflow Hindcasting (GAUSNET) approach for historical hydrological data reconstruction, through integrating the pros of Bayesian probabilistic framework along with the multi-layered neural networks.
+•	To perform hindcasting of past historical streamflow on daily basisconsideringselected stream gauging stations of Greater Pamba basin, India using GAUSNET, Long-Short Term Memory (LSTM) andGated Recurrent Unit (GRU).
+•	To compare the performance of various DL models for streamflowhindcasting based on different evaluation measures.
